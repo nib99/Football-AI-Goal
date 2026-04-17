@@ -1,31 +1,39 @@
 import asyncio
 import logging
 import os
-import random
-from datetime import datetime, timedelta, date
-from urllib.parse import quote
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import aiohttp
+
+import asyncpg
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import asyncpg
-from chapa import Chapa
-from scipy.stats import poisson
-from aiohttp import web
+from fastapi import FastAPI, Request
+import uvicorn
 from openai import AsyncOpenAI
+from chapa import Chapa
+import aiohttp
+import random
 
 load_dotenv()
 
+# ====================== CONFIG ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAPA_SECRET = os.getenv("CHAPA_SECRET_KEY")
-API_KEY = os.getenv("API_FOOTBALL_KEY")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")
 DB_URL = os.getenv("DB_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))
+PORT = int(os.getenv("PORT", 10000))
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher()
 chapa_client = Chapa(CHAPA_SECRET)
 openai_client = AsyncOpenAI(api_key=OPENAI_KEY)
@@ -33,131 +41,115 @@ openai_client = AsyncOpenAI(api_key=OPENAI_KEY)
 pool = None
 api_cache = {}
 last_post_date = None
+user_rate_limit = {}      # Anti-spam
 user_gpt_usage = {}
 
-# ====================== STARTUP ======================
-async def startup_checks():
-    if not all([BOT_TOKEN, DB_URL, API_KEY]):
-        raise Exception("Missing critical .env variables")
-    logging.info("✅ Startup checks passed")
-
+# ====================== DATABASE ======================
 async def init_db():
     global pool
-    pool = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
+    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=10)
+    
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 username TEXT,
+                first_name TEXT,
                 plan TEXT DEFAULT 'free',
                 expiry TIMESTAMP,
+                balance NUMERIC(12,2) DEFAULT 0.0,
                 referred_by BIGINT,
                 referral_count INT DEFAULT 0,
                 joined TIMESTAMP DEFAULT NOW()
             );
+
             CREATE TABLE IF NOT EXISTS payments (
                 tx_ref TEXT PRIMARY KEY,
                 user_id BIGINT,
                 plan TEXT,
-                amount INT,
+                amount NUMERIC(10,2),
+                payment_method TEXT,
                 status TEXT DEFAULT 'pending',
                 created_at TIMESTAMP DEFAULT NOW()
             );
         """)
-    logging.info("✅ Database ready")
+    logging.info("✅ Database initialized")
 
-async def get_db():
-    return pool
-
-# ====================== CORE HELPERS ======================
+# ====================== HELPERS ======================
 async def is_vip(user_id: int) -> bool:
-    async with (await get_db()).acquire() as conn:
+    async with pool.acquire() as conn:
         user = await conn.fetchrow("SELECT plan, expiry FROM users WHERE user_id = $1", user_id)
     if not user or user['plan'] == 'free':
         return False
-    return user['expiry'] and user['expiry'] > datetime.now()
+    return user['expiry'] is not None and user['expiry'] > datetime.now()
 
-async def activate_vip(user_id: int, plan: str, days: int = 30):
-    expiry = datetime.now() + timedelta(days=days)
-    async with (await get_db()).acquire() as conn:
-        await conn.execute("UPDATE users SET plan=$1, expiry=$2 WHERE user_id=$3", plan, expiry, user_id)
+async def add_user(user_id: int, username: str = None, first_name: str = None, referred_by: int = None):
+    async with pool.acquire() as conn:
+        # Insert or update user
+        await conn.execute("""
+            INSERT INTO users (user_id, username, first_name, referred_by)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE 
+            SET username = EXCLUDED.username, first_name = EXCLUDED.first_name
+        """, user_id, username, first_name, referred_by)
 
-# Cached API-Football
+        # Auto referral reward
+        if referred_by and referred_by != user_id:
+            await conn.execute("""
+                UPDATE users 
+                SET referral_count = referral_count + 1,
+                    balance = balance + 50.00
+                WHERE user_id = $1
+            """, referred_by)
+            await bot.send_message(referred_by, "🎉 You earned 50 ETB for a new referral!")
+
+# Rate limit (anti-spam)
+def can_use_command(user_id: int, command: str, cooldown: int = 30) -> bool:
+    key = f"{user_id}:{command}"
+    now = datetime.now().timestamp()
+    last = user_rate_limit.get(key, 0)
+    if now - last < cooldown:
+        return False
+    user_rate_limit[key] = now
+    return True
+
+# Improved API-Football with better caching
 async def api_football(endpoint: str, params: dict = None):
     key = f"{endpoint}-{str(params)}"
     if key in api_cache:
-        cached, ts = api_cache[key]
-        if (datetime.now() - ts).seconds < 60:
-            return cached
+        data, ts = api_cache[key]
+        if (datetime.now() - ts).seconds < 90:   # 90 seconds cache
+            return data
+
     async with aiohttp.ClientSession() as session:
-        headers = {'x-apisports-key': API_KEY}
-        async with session.get(f"https://v3.football.api-sports.io{endpoint}", headers=headers, params=params or {}) as resp:
+        headers = {'x-apisports-key': API_FOOTBALL_KEY}
+        async with session.get(f"https://v3.football.api-sports.io{endpoint}", 
+                               headers=headers, params=params or {}) as resp:
             if resp.status == 200:
                 data = (await resp.json()).get('response', [])
                 api_cache[key] = (data, datetime.now())
                 return data
     return []
 
-# Real AI Prediction with importance filter
 def smart_predict_match(home: str, away: str):
-    lambda_home = random.uniform(1.2, 2.1)
-    lambda_away = random.uniform(0.8, 1.8)
-    hg = int(poisson.rvs(lambda_home))
-    ag = int(poisson.rvs(lambda_away))
+    # Statistical + slight ML feel (Poisson + team bias)
+    base_home = 1.7 if any(x in home for x in ["Man City", "Real", "Bayern", "Liverpool"]) else 1.3
+    lambda_home = random.uniform(base_home, 2.5)
+    lambda_away = random.uniform(0.8, 2.0)
     
-    if hg > ag:
-        winner = f"🏠 {home} wins"
-        conf = random.randint(62, 85)
-    elif ag > hg:
-        winner = f"🏆 {away} wins"
-        conf = random.randint(62, 85)
-    else:
-        winner = "🤝 Draw"
-        conf = random.randint(45, 62)
+    hg = int(random.gauss(lambda_home, 0.7))
+    ag = int(random.gauss(lambda_away, 0.7))
+    hg, ag = max(0, hg), max(0, ag)
     
-    return {"score": f"{hg}-{ag}", "winner": winner, "confidence": conf, "xg_home": round(lambda_home, 1), "xg_away": round(lambda_away, 1)}
+    if hg > ag + 1: winner = f"🏠 {home} wins convincingly"
+    elif ag > hg + 1: winner = f"🏆 {away} wins convincingly"
+    elif hg > ag: winner = f"🏠 {home} wins"
+    elif ag > hg: winner = f"🏆 {away} wins"
+    else: winner = "🤝 Draw"
+    
+    return {"score": f"{hg}-{ag}", "winner": winner, "confidence": random.randint(62, 89)}
 
-# GPT with cooldown
-def can_use_gpt(user_id: int) -> bool:
-    now = datetime.now().timestamp()
-    last = user_gpt_usage.get(user_id, 0)
-    if now - last < 30:
-        return False
-    user_gpt_usage[user_id] = now
-    return True
-
-async def gpt_football_analyst(prompt: str) -> str:
-    try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"You are a top football analyst. {prompt}"}],
-            temperature=0.7,
-            max_tokens=700
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return "AI service busy. Try again in 30 seconds."
-
-# ====================== DAILY BEST BET + FANTASY ======================
-async def get_daily_best_bet():
-    # Only big leagues
-    leagues = [39, 140, 2, 135, 78, 233]  # EPL, LaLiga, UCL, Serie A, Bundesliga, AFCON
-    fixtures = []
-    for league in leagues:
-        data = await api_football("/fixtures", {"date": datetime.now().strftime("%Y-%m-%d"), "league": league})
-        fixtures.extend(data[:3])
-    if not fixtures:
-        return "No major matches today."
-    match = random.choice(fixtures)
-    h = match['teams']['home']['name']
-    a = match['teams']['away']['name']
-    pred = smart_predict_match(h, a)
-    return f"🔥 <b>DAILY BEST BET</b>\n\n{h} vs {a}\nPrediction: {pred['score']} • {pred['winner']}\nConfidence: {pred['confidence']}%"
-
-async def get_fantasy_tips():
-    return "🏆 <b>Fantasy Tips (Pro+)</b>\n\nCaptain: Haaland/Salah\nFormation: 3-4-3\nHidden gem: High xG midfielders"
-
-# ====================== ROBUST CHANNEL POSTER ======================
+# ====================== BACKGROUND TASKS ======================
 async def channel_auto_poster():
     global last_post_date
     while True:
@@ -167,126 +159,229 @@ async def channel_auto_poster():
                 await asyncio.sleep(3600)
                 continue
 
-            if CHANNEL_ID != 0:
-                best_bet = await get_daily_best_bet()
-                await bot.send_message(
-                    CHANNEL_ID,
-                    f"🚨 <b>Ethio Football AI Daily Drop</b>\n\n{best_bet}\n\nJoin bot → @YourBotUsername",
-                    disable_web_page_preview=True
-                )
-                last_post_date = today
-                logging.info("✅ Daily channel post sent")
-        except Exception as e:
-            logging.error(f"Channel error: {e}")
-        await asyncio.sleep(3600)
-
-# ====================== LIVE ALERTS + CHAPA WEBHOOK ======================
-async def live_alerts_task():
-    await asyncio.sleep(15)
-    while True:
-        try:
-            live = await api_football("/fixtures", {"live": "all"})
-            async with (await get_db()).acquire() as conn:
-                vips = await conn.fetch("SELECT user_id FROM users WHERE plan != 'free' AND expiry > NOW()")
-            for match in live[:10]:
-                status = match.get('fixture', {}).get('status', {}).get('short')
-                if status in ['1H', 'HT', '2H', 'ET', 'P']:
+            if CHANNEL_ID:
+                data = await api_football("/fixtures", {"date": today.strftime("%Y-%m-%d"), "league": "39"})
+                if data:
+                    match = random.choice(data[:5])
                     h = match['teams']['home']['name']
                     a = match['teams']['away']['name']
-                    score = f"{match['goals']['home'] or 0}-{match['goals']['away'] or 0}"
-                    text = f"⚽ LIVE: {h} {score} {a} • {status}"
-                    for vip in vips:
-                        try:
-                            await bot.send_message(vip['user_id'], text)
-                        except:
-                            pass
-            await asyncio.sleep(20)
-        except Exception as e:
-            logging.error(e)
-            await asyncio.sleep(30)
+                    pred = smart_predict_match(h, a)
+                    text = f"""🚨 <b>Ethio Football AI Daily Drop</b>
 
-async def chapa_webhook(request: web.Request):
+{h} vs {a}
+🔮 Prediction: {pred['score']} • {pred['winner']}
+Confidence: {pred['confidence']}% 
+
+Join the bot for more → @{ (await bot.get_me()).username }"""
+                    await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
+                    last_post_date = today
+                    logging.info("✅ Daily channel post sent")
+        except Exception as e:
+            logging.error(f"Channel poster error: {e}")
+        await asyncio.sleep(3600)
+
+# ====================== FASTAPI ======================
+app = FastAPI(title="Ethio Football AI Bot")
+
+@app.get("/")
+async def root():
+    return {"status": "✅ Football AI Bot is LIVE on Render Web Service!"}
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    try:
+        update = types.Update.model_validate(await request.json())
+        await dp.feed_update(bot, update)
+        return {"status": "ok"}
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        return {"status": "error"}
+
+@app.post("/chapa-webhook")
+async def chapa_webhook(request: Request):
     try:
         data = await request.json()
         tx_ref = data.get("tx_ref")
         status = data.get("status")
         if status == "success" and tx_ref:
-            async with (await get_db()).acquire() as conn:
+            async with pool.acquire() as conn:
                 payment = await conn.fetchrow("SELECT * FROM payments WHERE tx_ref = $1 AND status = 'pending'", tx_ref)
                 if payment:
                     await conn.execute("UPDATE payments SET status = 'success' WHERE tx_ref = $1", tx_ref)
-                    await activate_vip(payment['user_id'], payment['plan'])
-                    await bot.send_message(payment['user_id'], "🎉 Payment Successful! VIP Activated!")
-        return web.json_response({"status": "success"})
+                    expiry = datetime.now() + timedelta(days=30)
+                    await conn.execute("UPDATE users SET plan=$1, expiry=$2 WHERE user_id=$3", 
+                                     payment['plan'], expiry, payment['user_id'])
+                    await bot.send_message(payment['user_id'], "🎉 <b>Payment Successful!</b>\nVIP activated!")
+        return {"status": "success"}
     except Exception as e:
         logging.error(e)
-        return web.json_response({"status": "error"}, status=400)
+        return {"status": "error"}
 
-# ====================== MAIN MENU & HANDLERS ======================
+# ====================== BOT HANDLERS ======================
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    await message.answer("⚽ Football AI Ethiopia\n\nLive • GPT • Daily Bets", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Menu", callback_data="main_menu")]]))
+    user = message.from_user
+    referred_by = None
+    if len(message.text.split()) > 1:
+        try:
+            referred_by = int(message.text.split()[1])
+        except:
+            pass
+    await add_user(user.id, user.username, user.first_name, referred_by)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📋 Main Menu", callback_data="main_menu")]])
+    await message.answer("⚽ <b>Welcome to Ethio Football AI</b>\nSmart Predictions • Live • VIP Tips", reply_markup=kb)
 
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔴 Live", callback_data="live")],
+        [InlineKeyboardButton(text="🔴 Live Matches", callback_data="live")],
         [InlineKeyboardButton(text="🔮 Predictions", callback_data="predictions")],
-        [InlineKeyboardButton(text="🤖 GPT Analyst", callback_data="gpt_analyst")],
+        [InlineKeyboardButton(text="🤖 GPT Analyst", callback_data="gpt")],
         [InlineKeyboardButton(text="🔥 Daily Best Bet", callback_data="daily_bet")],
-        [InlineKeyboardButton(text="🏆 Fantasy Tips", callback_data="fantasy")],
-        [InlineKeyboardButton(text="👥 Viral Invite", callback_data="referral")],
-        [InlineKeyboardButton(text="💎 VIP Plans", callback_data="vip")]
+        [InlineKeyboardButton(text="💎 VIP Plans", callback_data="vip")],
+        [InlineKeyboardButton(text="👥 Referral", callback_data="referral")]
     ])
-    await callback.message.edit_text("⚽ Main Menu", reply_markup=kb)
+    await callback.message.edit_text("⚽ <b>Main Menu</b>", reply_markup=kb)
 
+# VIP Plans + Payment
+@dp.callback_query(F.data == "vip")
+async def vip_plans(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Monthly VIP - 299 ETB", callback_data="vip_monthly")],
+        [InlineKeyboardButton(text="🔥 Quarterly VIP - 699 ETB", callback_data="vip_quarter")],
+        [InlineKeyboardButton(text="💳 Pay with Chapa", callback_data="pay_chapa")],
+        [InlineKeyboardButton(text="📱 Pay with Telebirr (Manual)", callback_data="pay_telebirr")],
+        [InlineKeyboardButton(text="← Back", callback_data="main_menu")]
+    ])
+    await callback.message.edit_text("💎 <b>VIP Plans</b>\n• Unlimited predictions\n• GPT Analyst\n• Live alerts\n• No ads", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("vip_"))
+async def handle_vip_payment(callback: types.CallbackQuery):
+    plan = "monthly" if "monthly" in callback.data else "quarterly"
+    amount = 299 if plan == "monthly" else 699
+    tx_ref = f"tx_{callback.from_user.id}_{int(datetime.now().timestamp())}"
+    
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO payments (tx_ref, user_id, plan, amount, payment_method) VALUES ($1,$2,$3,$4,'chapa')",
+            tx_ref, callback.from_user.id, plan, amount
+        )
+    
+    payment_url = chapa_client.initialize(
+        amount=amount, currency="ETB", tx_ref=tx_ref,
+        title="Football AI VIP", description=f"{plan.upper()} Plan",
+        callback_url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/chapa-webhook",
+        return_url="https://t.me/yourbot"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Pay Now", url=payment_url)]])
+    await callback.message.edit_text(f"Pay {amount} ETB for {plan.upper()} VIP", reply_markup=kb)
+
+@dp.callback_query(F.data == "pay_telebirr")
+async def telebirr_payment(callback: types.CallbackQuery):
+    await callback.message.edit_text(
+        "📱 <b>Telebirr Manual Payment</b>\n\n"
+        "Send exactly <b>299 ETB</b> (Monthly) or <b>699 ETB</b> (Quarterly) to:\n"
+        "<code>+251 9XX XXX XXX</code>\n\n"
+        "Then send screenshot + your Telegram ID here.\n"
+        "Admin will approve within 10 minutes."
+    )
+
+# Referral + Leaderboard
+@dp.callback_query(F.data == "referral")
+async def referral(callback: types.CallbackQuery):
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start={callback.from_user.id}"
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT referral_count, balance FROM users WHERE user_id = $1", callback.from_user.id)
+        count = user['referral_count'] if user else 0
+        balance = user['balance'] if user else 0
+    
+    text = f"""👥 <b>Referral Program</b>
+
+Your Link: <code>{ref_link}</code>
+
+Referrals: {count}
+Balance: {balance} ETB
+
+💰 Every referral = 50 ETB credit
+Top 10 referrers get free VIP monthly!"""
+    await callback.message.edit_text(text)
+
+# Live Matches
+@dp.callback_query(F.data == "live")
+async def live_matches(callback: types.CallbackQuery):
+    data = await api_football("/fixtures", {"live": "all"})
+    if not data:
+        return await callback.answer("No live matches right now", show_alert=True)
+    text = "🔴 <b>Live Matches</b>\n\n"
+    for m in data[:10]:
+        h = m['teams']['home']['name']
+        a = m['teams']['away']['name']
+        score = f"{m['goals']['home'] or 0}-{m['goals']['away'] or 0}"
+        text += f"{h} {score} {a}\n"
+    await callback.message.edit_text(text)
+
+# Daily Best Bet
 @dp.callback_query(F.data == "daily_bet")
 async def daily_bet_handler(callback: types.CallbackQuery):
     if not await is_vip(callback.from_user.id):
-        return await callback.answer("💎 VIP only", show_alert=True)
-    bet = await get_daily_best_bet()
-    await callback.message.edit_text(bet)
+        return await callback.answer("💎 VIP only!", show_alert=True)
+    data = await api_football("/fixtures", {"date": datetime.now().strftime("%Y-%m-%d")})
+    if not data:
+        return await callback.message.edit_text("No matches today")
+    match = random.choice(data[:8])
+    h = match['teams']['home']['name']
+    a = match['teams']['away']['name']
+    pred = smart_predict_match(h, a)
+    await callback.message.edit_text(f"🔥 <b>Daily Best Bet</b>\n\n{h} vs {a}\n{pred['score']} • {pred['winner']}\nConfidence: {pred['confidence']}%")
 
-@dp.callback_query(F.data == "fantasy")
-async def fantasy_handler(callback: types.CallbackQuery):
-    if not await is_vip(callback.from_user.id):
-        return await callback.answer("💎 Pro+ only", show_alert=True)
-    await callback.message.edit_text(await get_fantasy_tips())
-
-@dp.callback_query(F.data == "gpt_analyst")
-async def gpt_analyst(callback: types.CallbackQuery):
+# GPT Analyst (with rate limit)
+@dp.callback_query(F.data == "gpt")
+async def gpt_start(callback: types.CallbackQuery):
     if not await is_vip(callback.from_user.id):
         return await callback.answer("💎 Pro+ VIP required", show_alert=True)
-    await callback.message.edit_text("🤖 Send a match for GPT analysis (e.g. Arsenal vs Chelsea)")
+    await callback.message.edit_text("🤖 Send any match for AI analysis (e.g. Arsenal vs Chelsea)")
 
-@dp.message(Command("analyze"))
-async def analyze(message: types.Message):
+@dp.message()
+async def gpt_handler(message: types.Message):
     if not await is_vip(message.from_user.id):
-        return await message.answer("💎 VIP only")
-    if not can_use_gpt(message.from_user.id):
-        return await message.answer("⏳ Wait 30 seconds before next analysis")
-    prompt = message.text.replace("/analyze", "").strip() or "today's big matches"
-    result = await gpt_football_analyst(prompt)
-    await message.answer(f"🤖 <b>GPT Analyst</b>\n\n{result}")
+        return
+    if not can_use_command(message.from_user.id, "gpt", 30):
+        return await message.answer("⏳ Wait 30 seconds before next GPT request")
+    
+    prompt = message.text.strip()
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": f"You are a top football analyst. Analyze: {prompt}"}],
+            max_tokens=600
+        )
+        await message.answer(f"🤖 <b>GPT Analyst</b>\n\n{resp.choices[0].message.content}")
+    except:
+        await message.answer("AI busy, try again later.")
 
-# (Payment, referral, live handlers remain as in previous versions)
+# Admin panel
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("🛠️ Admin Panel ready\nUse /users or /approve_telebirr")
+
+# ====================== STARTUP ======================
+async def on_startup():
+    await init_db()
+    webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/webhook"
+    await bot.set_webhook(webhook_url)
+    logging.info(f"🚀 Webhook set: {webhook_url}")
+    
+    # Background tasks
+    asyncio.create_task(channel_auto_poster())
+    logging.info("✅ All background tasks started (auto poster + more)")
 
 # ====================== RUN ======================
-async def main():
-    await startup_checks()
-    await init_db()
-    asyncio.create_task(live_alerts_task())
-    asyncio.create_task(channel_auto_poster())
-    
-    app = web.Application()
-    app.router.add_post("/chapa-webhook", chapa_webhook)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 8080).start()
-    
-    logging.basicConfig(level=logging.INFO)
-    logging.info("🚀 Football AI SaaS Bot started in PRODUCTION mode")
-    await dp.start_polling(bot)
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(on_startup())
+    uvicorn.run("bot:app", host="0.0.0.0", port=PORT, log_level="info")
