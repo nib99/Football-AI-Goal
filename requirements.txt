@@ -1,0 +1,7 @@
+aiogram==3.13
+aiohttp
+asyncpg
+chapa
+python-dotenv
+openai
+scipy
