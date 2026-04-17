@@ -1,18 +1,17 @@
-# Core
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+
 aiogram==3.4.1
-python-dotenv==1.0.1
-asyncpg==0.29.0
-chapa==0.1.2
 
-# OpenAI Fix
 openai==1.23.6
-httpx==0.27.2          # <-- This is the most important fix
 
-# Optional / Nice to have
-aiofiles==23.2.1
+httpx==0.27.2
 aiohttp==3.9.5
 
-# Remove or keep only if you really need them
-# fastapi==0.110.0
-# uvicorn==0.29.0
-# scipy==1.11.4
+asyncpg==0.29.0
+
+python-dotenv==1.0.1
+
+scipy==1.13.0
+
+chapa==0.1.0
