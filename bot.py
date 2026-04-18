@@ -13,7 +13,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from fastapi import FastAPI, Request
 import uvicorn
 from openai import AsyncOpenAI
-from chapa import Chapa
+import httpx
 import aiohttp
 import random
 
