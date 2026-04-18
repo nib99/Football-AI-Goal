@@ -244,35 +244,73 @@ async def main_menu(callback: types.CallbackQuery):
     ])
     await callback.message.edit_text("⚽ <b>Main Menu</b>", reply_markup=kb)
 
-# VIP Plans + Payment
+# ====================== VIP PLANS + PAYMENT ======================
+
 @dp.callback_query(F.data == "vip")
 async def vip_plans(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 Monthly VIP - 299 ETB", callback_data="vip_monthly")],
-        [InlineKeyboardButton(text="🔥 Quarterly VIP - 699 ETB", callback_data="vip_quarter")],
-        [InlineKeyboardButton(text="💳 Pay with Chapa", callback_data="pay_chapa")],
-        [InlineKeyboardButton(text="📱 Pay with Telebirr (Manual)", callback_data="pay_telebirr")],
+        [InlineKeyboardButton(text="🔥 Quarterly VIP - 699 ETB", callback_data="vip_quarterly")],
         [InlineKeyboardButton(text="← Back", callback_data="main_menu")]
     ])
-    await callback.message.edit_text("💎 <b>VIP Plans</b>\n• Unlimited predictions\n• GPT Analyst\n• Live alerts\n• No ads", reply_markup=kb)
+    await callback.message.edit_text(
+        "💎 <b>VIP Plans</b>\n\n"
+        "• Unlimited predictions\n"
+        "• GPT Analyst\n"
+        "• Live alerts\n"
+        "• No ads", 
+        reply_markup=kb
+    )
+
 
 @dp.callback_query(F.data.startswith("vip_"))
 async def handle_vip_payment(callback: types.CallbackQuery):
-    plan = "monthly" if "monthly" in callback.data else "quarterly"
-    amount = 299 if plan == "monthly" else 699
+    # Determine plan and amount
+    if "monthly" in callback.data:
+        plan = "monthly"
+        amount = 299
+    else:
+        plan = "quarterly"
+        amount = 699
+
     tx_ref = f"tx_{callback.from_user.id}_{int(datetime.now().timestamp())}"
-    
+
+    # Save payment record to database
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO payments (tx_ref, user_id, plan, amount, payment_method) VALUES ($1,$2,$3,$4,'chapa')",
+            "INSERT INTO payments (tx_ref, user_id, plan, amount, payment_method) "
+            "VALUES ($1, $2, $3, $4, 'chapa')",
             tx_ref, callback.from_user.id, plan, amount
         )
-    
-    payment_url = res = await create_payment(email, amount, tx_ref)
-checkout_url = res["data"]["checkout_url"]
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Pay Now", url=payment_url)]])
-    await callback.message.edit_text(f"Pay {amount} ETB for {plan.upper()} VIP", reply_markup=kb)
+
+    # === Create Chapa Payment Link ===
+    try:
+        # Make sure you have these variables available (email is required by Chapa)
+        user_email = "user@example.com"   # ← Change this! Better to get from user data
+
+        res = await create_payment(
+            email=user_email,
+            amount=amount,
+            tx_ref=tx_ref
+        )
+
+        checkout_url = res["data"]["checkout_url"]   # This is the payment link
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Pay Now", url=checkout_url)]
+        ])
+
+        await callback.message.edit_text(
+            f"💰 Pay <b>{amount} ETB</b> for {plan.upper()} VIP",
+            reply_markup=kb
+        )
+
+    except Exception as e:
+        await callback.message.edit_text(
+            "❌ Failed to create payment link. Please try again later."
+        )
+        print(f"Payment creation error: {e}")
+
 
 @dp.callback_query(F.data == "pay_telebirr")
 async def telebirr_payment(callback: types.CallbackQuery):
@@ -280,8 +318,9 @@ async def telebirr_payment(callback: types.CallbackQuery):
         "📱 <b>Telebirr Manual Payment</b>\n\n"
         "Send exactly <b>299 ETB</b> (Monthly) or <b>699 ETB</b> (Quarterly) to:\n"
         "<code>+251 9XX XXX XXX</code>\n\n"
-        "Then send screenshot + your Telegram ID here.\n"
-        "Admin will approve within 10 minutes."
+        "After payment, send the screenshot + your Telegram ID to admin.\n"
+        "Approval usually within 10-30 minutes.",
+        parse_mode="HTML"
     )
 
 # Referral + Leaderboard
