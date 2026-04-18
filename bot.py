@@ -268,12 +268,8 @@ async def handle_vip_payment(callback: types.CallbackQuery):
             tx_ref, callback.from_user.id, plan, amount
         )
     
-    payment_url = chapa_client.initialize(
-        amount=amount, currency="ETB", tx_ref=tx_ref,
-        title="Football AI VIP", description=f"{plan.upper()} Plan",
-        callback_url=f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}/chapa-webhook",
-        return_url="https://t.me/yourbot"
-    )
+    payment_url = res = await create_payment(email, amount, tx_ref)
+checkout_url = res["data"]["checkout_url"]
     
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Pay Now", url=payment_url)]])
     await callback.message.edit_text(f"Pay {amount} ETB for {plan.upper()} VIP", reply_markup=kb)
